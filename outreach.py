@@ -1,9 +1,9 @@
 """
 Aggarwal Electric Company — Automated Vendor Empanelment Outreach
 =================================================================
-Sends your fixed email template + catalogue PDF via Gmail.
-Fetches prospects from Apollo.io.
-Tracks everything in a LOCAL CSV file (no Google Sheets needed).
+Reads prospects from prospects.csv (exported from Apollo website).
+Sends fixed email template + catalogue link via Gmail.
+Tracks everything in outreach_tracker.csv.
 Handles follow-ups at Day 5 and Day 10 if no reply.
 """
 
@@ -12,13 +12,10 @@ import csv
 import time
 import base64
 import logging
-import requests
 import pickle
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
 from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -27,13 +24,13 @@ from googleapiclient.discovery import build
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-APOLLO_API_KEY       = os.environ.get("APOLLO_API_KEY", "YOUR_APOLLO_API_KEY")
 SENDER_EMAIL         = os.environ.get("SENDER_EMAIL", "aggelectric@gmail.com")
 SENDER_NAME          = os.environ.get("SENDER_NAME", "Deepanshu Garg")
-CATALOGUE_PATH       = "AGGARWAL_ELECTRIC_CATALOGUE.pdf"
+CATALOGUE_LINK       = os.environ.get("CATALOGUE_LINK", "YOUR_GOOGLE_DRIVE_LINK")
 GMAIL_CREDENTIALS    = "gmail_credentials.json"
 GMAIL_TOKEN_FILE     = "gmail_token.pickle"
-TRACKER_CSV          = "outreach_tracker.csv"   # auto-created on first run
+PROSPECTS_CSV        = "prospects.csv"       # you upload this from Apollo export
+TRACKER_CSV          = "outreach_tracker.csv"  # auto-created, tracks all sends
 
 # Rate limits
 EMAILS_PER_DAY       = 15
@@ -44,28 +41,6 @@ FOLLOW_UP_2_DAYS     = 10
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
-]
-
-# Apollo search filters
-APOLLO_TITLES = [
-    "Purchase Manager", "Purchasing Manager",
-    "Procurement Manager", "Procurement Head",
-    "Sourcing Manager", "Sourcing Head",
-    "Supply Chain Manager", "Supply Chain Head",
-    "Materials Manager", "Materials Head",
-]
-APOLLO_KEYWORDS = [
-    "solar EPC", "solar developer", "solar energy",
-    "renewable energy", "EPC contractor", "solar power",
-    "infrastructure", "industrial", "manufacturing",
-]
-
-# ─── CSV COLUMNS ─────────────────────────────────────────────────────────────
-
-CSV_FIELDS = [
-    "email", "first_name", "last_name", "company", "title",
-    "status", "initial_sent_date", "followup1_date", "followup2_date",
-    "replied", "unsubscribed", "last_updated", "notes"
 ]
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
@@ -99,7 +74,8 @@ def get_initial_body(first_name, email):
 
 I would like to introduce Aggarwal Electric Company (Estd. 1995), based in India — an authorized distributor of Polycab Wires & Cables and authorized dealer for Bajaj, Crompton, Anchor, Panasonic, Dowell's, GreatWhite, and many more leading brands.
 
-Please find our company profile and product catalogue attached for your reference.
+Please find our company profile and product catalogue here:
+{CATALOGUE_LINK}
 
 Why Choose Us:
 - Authorized & Genuine Products
@@ -131,9 +107,10 @@ I hope you are doing well. I am following up on my earlier email regarding vendo
 
 In case my previous email got missed, we are an authorized distributor of Polycab Wires & Cables and dealer for Bajaj, Crompton, Anchor, Panasonic, Dowell's, GreatWhite, and many more brands.
 
-We would be glad to be registered as an approved vendor with your organization. Please let us know the process or documentation required and we will promptly comply.
+You can view our product catalogue here:
+{CATALOGUE_LINK}
 
-I have re-attached our catalogue for your convenience.
+We would be glad to be registered as an approved vendor with your organization. Please let us know the process or documentation required and we will promptly comply.
 
 --
 Best Regards,
@@ -153,7 +130,8 @@ I am writing for the last time regarding our vendor empanelment request for Agga
 
 We understand you may be busy and we respect your time completely. Should your organization ever require reliable electrical products — wires & cables, switchgear, lighting, earthing, or industrial accessories — from trusted brands like Polycab, Bajaj, Crompton, Anchor, and Panasonic, please do consider us.
 
-Our catalogue is attached for future reference. No action is needed from your end right now.
+Our catalogue is available here for future reference:
+{CATALOGUE_LINK}
 
 Thank you for your time and we wish your organization continued success.
 
@@ -168,19 +146,79 @@ Website: www.aggarwalelectric.com
 To unsubscribe, reply with "Unsubscribe" in the subject line.
 """
 
-# ─── CSV TRACKER ─────────────────────────────────────────────────────────────
+# ─── PROSPECTS CSV ───────────────────────────────────────────────────────────
+
+def load_prospects() -> list:
+    """
+    Load prospects from Apollo CSV export.
+    Apollo exports with columns like:
+    First Name, Last Name, Title, Company, Email, ...
+    We try multiple column name formats to be safe.
+    """
+    if not Path(PROSPECTS_CSV).exists():
+        log.warning(f"No {PROSPECTS_CSV} found — nothing to send.")
+        return []
+
+    prospects = []
+    with open(PROSPECTS_CSV, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Try multiple possible column names from Apollo export
+            email = (
+                row.get("Email") or row.get("email") or
+                row.get("Work Email") or row.get("work_email") or ""
+            ).strip().lower()
+
+            if not email or "@" not in email:
+                continue
+
+            first_name = (
+                row.get("First Name") or row.get("first_name") or
+                row.get("FirstName") or ""
+            ).strip()
+
+            last_name = (
+                row.get("Last Name") or row.get("last_name") or
+                row.get("LastName") or ""
+            ).strip()
+
+            company = (
+                row.get("Company") or row.get("company") or
+                row.get("Organization") or row.get("Account Name") or ""
+            ).strip()
+
+            title = (
+                row.get("Title") or row.get("title") or
+                row.get("Job Title") or row.get("job_title") or ""
+            ).strip()
+
+            prospects.append({
+                "email":      email,
+                "first_name": first_name,
+                "last_name":  last_name,
+                "company":    company,
+                "title":      title,
+            })
+
+    log.info(f"Loaded {len(prospects)} prospects from {PROSPECTS_CSV}")
+    return prospects
+
+# ─── TRACKER CSV ─────────────────────────────────────────────────────────────
+
+CSV_FIELDS = [
+    "email", "first_name", "last_name", "company", "title",
+    "status", "initial_sent_date", "followup1_date", "followup2_date",
+    "replied", "unsubscribed", "last_updated"
+]
 
 def load_tracker() -> dict:
-    """Load CSV into dict keyed by email. Creates file if missing."""
     if not Path(TRACKER_CSV).exists():
         with open(TRACKER_CSV, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            writer.writeheader()
+            csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
         log.info(f"Created new tracker: {TRACKER_CSV}")
         return {}
-
     tracker = {}
-    with open(TRACKER_CSV, "r", newline="") as f:
+    with open(TRACKER_CSV, "r", newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             if row.get("email"):
                 tracker[row["email"].lower()] = row
@@ -189,7 +227,6 @@ def load_tracker() -> dict:
 
 
 def save_tracker(tracker: dict):
-    """Write entire tracker dict back to CSV."""
     with open(TRACKER_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
@@ -198,25 +235,22 @@ def save_tracker(tracker: dict):
 
 
 def upsert(tracker: dict, prospect: dict, status: str):
-    """Add new prospect or update existing one in tracker dict."""
     email = prospect["email"]
     now   = datetime.now().strftime("%Y-%m-%d %H:%M")
-
     if email not in tracker:
         tracker[email] = {
-            "email":              email,
-            "first_name":         prospect.get("first_name", ""),
-            "last_name":          prospect.get("last_name", ""),
-            "company":            prospect.get("company", ""),
-            "title":              prospect.get("title", ""),
-            "status":             status,
-            "initial_sent_date":  now if status == "initial_sent"   else "",
-            "followup1_date":     now if status == "followup1_sent" else "",
-            "followup2_date":     now if status == "followup2_sent" else "",
-            "replied":            "No",
-            "unsubscribed":       "No",
-            "last_updated":       now,
-            "notes":              "",
+            "email":             email,
+            "first_name":        prospect.get("first_name", ""),
+            "last_name":         prospect.get("last_name", ""),
+            "company":           prospect.get("company", ""),
+            "title":             prospect.get("title", ""),
+            "status":            status,
+            "initial_sent_date": now if status == "initial_sent"   else "",
+            "followup1_date":    now if status == "followup1_sent" else "",
+            "followup2_date":    now if status == "followup2_sent" else "",
+            "replied":           "No",
+            "unsubscribed":      "No",
+            "last_updated":      now,
         }
     else:
         tracker[email]["status"]       = status
@@ -229,23 +263,16 @@ def upsert(tracker: dict, prospect: dict, status: str):
             tracker[email]["followup2_date"] = now
 
 
-def mark_replied(tracker: dict, email: str):
+def mark_replied(tracker, email):
     if email in tracker:
         tracker[email]["replied"]      = "Yes"
         tracker[email]["status"]       = "replied"
         tracker[email]["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-def mark_unsubscribed(tracker: dict, email: str):
-    if email in tracker:
-        tracker[email]["unsubscribed"] = "Yes"
-        tracker[email]["status"]       = "unsubscribed"
-        tracker[email]["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-def days_since(date_str: str):
+def days_since(date_str):
     if not date_str:
         return None
     try:
@@ -256,21 +283,6 @@ def days_since(date_str: str):
 
 def is_unsubscribed(r): return str(r.get("unsubscribed","")).lower() in ("yes","1","true")
 def has_replied(r):     return str(r.get("replied","")).lower()       in ("yes","1","true")
-
-# ─── CATALOGUE ATTACHMENT ────────────────────────────────────────────────────
-
-def attach_catalogue(msg: MIMEMultipart) -> MIMEMultipart:
-    if not os.path.exists(CATALOGUE_PATH):
-        log.warning(f"Catalogue not found at '{CATALOGUE_PATH}' — sending without it.")
-        return msg
-    with open(CATALOGUE_PATH, "rb") as f:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(f.read())
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition",
-                    'attachment; filename="Aggarwal_Electric_Company_Catalogue.pdf"')
-    msg.attach(part)
-    return msg
 
 # ─── GMAIL ───────────────────────────────────────────────────────────────────
 
@@ -283,7 +295,8 @@ def get_gmail_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(GMAIL_CREDENTIALS, GMAIL_SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(
+                GMAIL_CREDENTIALS, GMAIL_SCOPES)
             creds = flow.run_local_server(port=0)
         with open(GMAIL_TOKEN_FILE, "wb") as f:
             pickle.dump(creds, f)
@@ -297,9 +310,9 @@ def send_email(service, to: str, subject: str, body: str) -> bool:
         msg["To"]      = to
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
-        msg = attach_catalogue(msg)
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        service.users().messages().send(
+            userId="me", body={"raw": raw}).execute()
         log.info(f"  ✓ Sent → {to}")
         return True
     except Exception as e:
@@ -316,43 +329,6 @@ def check_for_reply(service, prospect_email: str) -> bool:
         log.warning(f"Reply check failed for {prospect_email}: {e}")
         return False
 
-# ─── APOLLO ──────────────────────────────────────────────────────────────────
-
-def fetch_apollo_prospects(page=1, per_page=25) -> list:
-    url     = "https://api.apollo.io/v1/mixed_people/search"
-    headers = {"Content-Type": "application/json",
-               "Cache-Control": "no-cache",
-               "X-Api-Key": APOLLO_API_KEY}
-    payload = {
-        "page": page, "per_page": per_page,
-        "person_titles": APOLLO_TITLES,
-        "q_organization_keyword_tags": APOLLO_KEYWORDS,
-        "person_locations": ["India"],
-        "contact_email_status": ["verified", "likely to engage"],
-    }
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        people = resp.json().get("people", [])
-        log.info(f"Apollo: {len(people)} prospects (page {page})")
-        return people
-    except requests.RequestException as e:
-        log.error(f"Apollo error: {e}")
-        return []
-
-
-def parse_prospect(person: dict):
-    email = person.get("email")
-    if not email or "@" not in email:
-        return None
-    return {
-        "email":      email.lower().strip(),
-        "first_name": (person.get("first_name") or "").strip(),
-        "last_name":  (person.get("last_name")  or "").strip(),
-        "company":    ((person.get("organization") or {}).get("name") or "").strip(),
-        "title":      (person.get("title") or "").strip(),
-    }
-
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def run_outreach():
@@ -362,9 +338,10 @@ def run_outreach():
 
     gmail      = get_gmail_service()
     tracker    = load_tracker()
+    prospects  = load_prospects()
     sent_today = 0
 
-    # ── Phase 1: Follow-ups ───────────────────────────────────────────────
+    # ── Phase 1: Follow-ups on existing contacts ──────────────────────────
     log.info("── Phase 1: Follow-ups ──")
     for email, record in list(tracker.items()):
         if sent_today >= EMAILS_PER_DAY:
@@ -376,69 +353,68 @@ def run_outreach():
 
         status     = record.get("status", "")
         first_name = record.get("first_name", "")
-        prospect   = {"email": email, "first_name": first_name,
-                      "last_name": record.get("last_name",""),
-                      "company": record.get("company",""),
-                      "title": record.get("title","")}
+        prospect   = {
+            "email":      email,
+            "first_name": first_name,
+            "last_name":  record.get("last_name", ""),
+            "company":    record.get("company", ""),
+            "title":      record.get("title", ""),
+        }
 
-        # Check for reply
+        # Check for reply in inbox
         if check_for_reply(gmail, email):
-            log.info(f"Reply detected from {email}")
+            log.info(f"Reply detected from {email} — marking replied")
             mark_replied(tracker, email)
             continue
 
-        # Follow-up 1 — after 5 days
+        # Follow-up 1 — Day 5
         if status == "initial_sent":
             days = days_since(record.get("initial_sent_date", ""))
             if days is not None and days >= FOLLOW_UP_1_DAYS:
-                log.info(f"Follow-up 1 → {email} ({days}d since initial)")
-                if send_email(gmail, email, SUBJECT, get_followup1_body(first_name, email)):
+                log.info(f"Follow-up 1 → {email} ({days}d)")
+                if send_email(gmail, email, SUBJECT,
+                              get_followup1_body(first_name, email)):
                     upsert(tracker, prospect, "followup1_sent")
                     sent_today += 1
                     time.sleep(DELAY_BETWEEN_EMAILS)
 
-        # Follow-up 2 — after 10 days
+        # Follow-up 2 — Day 10
         elif status == "followup1_sent":
             days = days_since(record.get("followup1_date", ""))
             if days is not None and days >= (FOLLOW_UP_2_DAYS - FOLLOW_UP_1_DAYS):
-                log.info(f"Follow-up 2 → {email} ({days}d since FU1)")
-                if send_email(gmail, email, SUBJECT, get_followup2_body(first_name, email)):
+                log.info(f"Follow-up 2 → {email} ({days}d)")
+                if send_email(gmail, email, SUBJECT,
+                              get_followup2_body(first_name, email)):
                     upsert(tracker, prospect, "followup2_sent")
                     sent_today += 1
                     time.sleep(DELAY_BETWEEN_EMAILS)
 
-    # ── Phase 2: New prospects from Apollo ───────────────────────────────
-    log.info("── Phase 2: New prospects ──")
-    page = 1
-    while sent_today < EMAILS_PER_DAY:
-        people = fetch_apollo_prospects(page=page, per_page=25)
-        if not people:
+    # ── Phase 2: New prospects from prospects.csv ─────────────────────────
+    log.info("── Phase 2: New prospects from CSV ──")
+    for prospect in prospects:
+        if sent_today >= EMAILS_PER_DAY:
+            log.warning("Daily limit reached.")
             break
 
-        for person in people:
-            if sent_today >= EMAILS_PER_DAY:
-                break
-            prospect = parse_prospect(person)
-            if not prospect:
-                continue
-            email = prospect["email"]
+        email = prospect["email"]
 
-            # Skip already contacted
-            if email in tracker and tracker[email].get("status"):
-                log.info(f"  Skip (known): {email}")
-                continue
+        # Skip if already in tracker with a status
+        if email in tracker and tracker[email].get("status"):
+            log.info(f"  Skip (already contacted): {email}")
+            continue
 
-            log.info(f"Initial → {email} ({prospect['company']})")
-            if send_email(gmail, email, SUBJECT,
-                          get_initial_body(prospect["first_name"], email)):
-                upsert(tracker, prospect, "initial_sent")
-                sent_today += 1
-                time.sleep(DELAY_BETWEEN_EMAILS)
+        # Skip unsubscribed
+        if email in tracker and is_unsubscribed(tracker[email]):
+            continue
 
-        page += 1
-        time.sleep(2)
+        log.info(f"Initial → {email} ({prospect.get('company','')})")
+        if send_email(gmail, email, SUBJECT,
+                      get_initial_body(prospect["first_name"], email)):
+            upsert(tracker, prospect, "initial_sent")
+            sent_today += 1
+            time.sleep(DELAY_BETWEEN_EMAILS)
 
-    # ── Save tracker CSV ─────────────────────────────────────────────────
+    # ── Save tracker ──────────────────────────────────────────────────────
     save_tracker(tracker)
     log.info(f"Tracker saved → {TRACKER_CSV}")
     log.info(f"── Done. Sent: {sent_today}/{EMAILS_PER_DAY} ──")
