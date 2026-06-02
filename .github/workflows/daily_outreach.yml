@@ -1,0 +1,58 @@
+name: Daily Vendor Outreach — Aggarwal Electric
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-outreach:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore tracker CSV from previous run
+        uses: actions/cache@v4
+        with:
+          path: outreach_tracker.csv
+          key: tracker-csv-${{ github.run_number }}
+          restore-keys: tracker-csv-
+
+      - name: Write credential files from secrets
+        run: |
+          echo '${{ secrets.GMAIL_CREDENTIALS_JSON }}' > gmail_credentials.json
+          echo '${{ secrets.GMAIL_TOKEN_PICKLE_B64 }}' | base64 -d > gmail_token.pickle
+          echo '${{ secrets.CATALOGUE_PDF_B64 }}'      | base64 -d > AGGARWAL_ELECTRIC_CATALOGUE.pdf
+
+      - name: Run outreach
+        env:
+          APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
+          SENDER_EMAIL:   ${{ secrets.SENDER_EMAIL }}
+          SENDER_NAME:    ${{ secrets.SENDER_NAME }}
+        run: python outreach.py
+
+      - name: Upload tracker CSV as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracker-${{ github.run_id }}
+          path: outreach_tracker.csv
+          retention-days: 90
+
+      - name: Upload log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ github.run_id }}
+          path: outreach.log
+          retention-days: 30
