@@ -2,7 +2,7 @@ name: Daily Vendor Outreach — Aggarwal Electric
 
 on:
   schedule:
-    - cron: "30 3 * * *"
+    - cron: "30 3 * * *"   # 9:00 AM IST every day
   workflow_dispatch:
 
 jobs:
@@ -32,16 +32,15 @@ jobs:
         run: |
           echo '${{ secrets.GMAIL_CREDENTIALS_JSON }}' > gmail_credentials.json
           echo '${{ secrets.GMAIL_TOKEN_PICKLE_B64 }}' | base64 -d > gmail_token.pickle
-          echo '${{ secrets.CATALOGUE_PDF_B64 }}'      | base64 -d > AGGARWAL_ELECTRIC_CATALOGUE.pdf
 
       - name: Run outreach
         env:
-          APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
-          SENDER_EMAIL:   ${{ secrets.SENDER_EMAIL }}
-          SENDER_NAME:    ${{ secrets.SENDER_NAME }}
+          SENDER_EMAIL:    ${{ secrets.SENDER_EMAIL }}
+          SENDER_NAME:     ${{ secrets.SENDER_NAME }}
+          CATALOGUE_LINK:  ${{ secrets.CATALOGUE_LINK }}
         run: python outreach.py
 
-      - name: Upload tracker CSV as artifact
+      - name: Upload tracker CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -49,7 +48,7 @@ jobs:
           path: outreach_tracker.csv
           retention-days: 90
 
-      - name: Upload log as artifact
+      - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
         with:
